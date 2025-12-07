@@ -1,0 +1,185 @@
+#include <xc.h>
+#define _XTAL_FREQ 4000000UL // 4 MHz
+
+// CONFIG
+#pragma config FOSC = HS
+#pragma config WDTE = OFF
+#pragma config PWRTE = OFF
+#pragma config BOREN = ON
+#pragma config LVP = OFF
+#pragma config CPD = OFF
+#pragma config WRT = OFF
+#pragma config CP = OFF
+
+// Pins
+#define OUT_PULSE RB0       // buzzer output
+#define TRIG      RC0
+#define ECHO      RC1
+#define SERVO_PIN RC2
+
+// LCD Pins (4-bit)
+#define RS RB2
+#define EN RB3
+#define D4 RB4
+#define D5 RB5
+#define D6 RB6
+#define D7 RB7
+
+#define DETECT_CM 15
+#define FLASH_MS 100        // buzzer flash length (ms)
+
+// Servo globals
+volatile unsigned int pulse_us = 1500; 
+volatile unsigned char pulseState = 0; 
+volatile unsigned char updateFlag = 0; 
+
+// UI state
+typedef enum { SCREEN_AREA_CLEAR = 0, SCREEN_OBJECT_DETECTED = 1 } ScreenState;
+volatile ScreenState screenState = SCREEN_AREA_CLEAR;
+
+// ---------- Soft ms delay ----------
+void soft_delay_ms(unsigned int ms) { while(ms--) __delay_ms(1); }
+
+// ---------- LCD ----------
+void LCD_Command(unsigned char cmd) {
+    RS = 0;
+    D4 = (cmd >> 4) & 1; D5 = (cmd >> 5) & 1; D6 = (cmd >> 6) & 1; D7 = (cmd >> 7) & 1;
+    EN = 1; __delay_us(5); EN = 0;
+    D4 = cmd & 1; D5 = (cmd >> 1) & 1; D6 = (cmd >> 2) & 1; D7 = (cmd >> 3) & 1;
+    EN = 1; __delay_us(5); EN = 0;
+    if(cmd==0x01||cmd==0x02) __delay_ms(2); else __delay_us(50);
+}
+
+void LCD_Char(unsigned char data) {
+    RS = 1;
+    D4 = (data >> 4) & 1; D5 = (data >> 5) & 1; D6 = (data >> 6) & 1; D7 = (data >> 7) & 1;
+    EN = 1; __delay_us(5); EN = 0;
+    D4 = data & 1; D5 = (data >> 1) & 1; D6 = (data >> 2) & 1; D7 = (data >> 3) & 1;
+    EN = 1; __delay_us(5); EN = 0;
+}
+
+void LCD_String(const char *str) { while(*str) LCD_Char(*str++); }
+
+void LCD_Init(void) {
+    TRISB2 = TRISB3 = TRISB4 = TRISB5 = TRISB6 = TRISB7 = 0;
+    __delay_ms(20);
+    LCD_Command(0x33); LCD_Command(0x32);
+    LCD_Command(0x28); LCD_Command(0x0C); LCD_Command(0x06);
+    LCD_Command(0x01); __delay_ms(2);
+}
+
+// ---------- Timer1 ----------
+void loadTimer1_us(unsigned int us) {
+    unsigned int preload = 65536u - us;
+    TMR1H = (preload >> 8) & 0xFF;
+    TMR1L = preload & 0xFF;
+}
+
+void __interrupt() isr(void) {
+    if(TMR1IF) {
+        TMR1IF=0;
+        if(pulseState==0) {
+            SERVO_PIN=1; pulseState=1; loadTimer1_us(pulse_us);
+        } else {
+            SERVO_PIN=0; pulseState=0; loadTimer1_us(20000u - pulse_us);
+            updateFlag=1;
+        }
+    }
+}
+
+// ---------- Ultrasonic ----------
+unsigned int measure_echo_us(void) {
+    unsigned long timeout=30000UL;
+    unsigned int count=0;
+    TRIG=0; __delay_us(2);
+    TRIG=1; __delay_us(10);
+    TRIG=0;
+    while(!ECHO) { if(--timeout==0) return 0xFFFF; __delay_us(1); }
+    count=0; timeout=30000UL;
+    while(ECHO) { if(++count>=timeout) return 0xFFFF; __delay_us(1); }
+    return count;
+}
+
+// ---------- Servo angle ----------
+unsigned int pulse_to_angle(unsigned int pulse) {
+    if(pulse<500) pulse=500;
+    if(pulse>2500) pulse=2500;
+    return ((unsigned long)(pulse-500)*180UL)/2000UL;
+}
+
+// ---------- Buzzer ----------
+void buzz_ms(unsigned int ms) { while(ms--) { OUT_PULSE=1; __delay_us(250); OUT_PULSE=0; __delay_us(250); } }
+
+// ---------- Hardware ----------
+void init_hw(void) {
+    ADCON1=0x07; CMCON=0x07; OPTION_REGbits.nRBPU=1;
+    TRISB0=0; TRISC2=0; TRISC0=0; TRISC1=1;
+    OUT_PULSE=0; SERVO_PIN=0; TRIG=0;
+    T1CKPS0=0; T1CKPS1=0; TMR1CS=0;
+    loadTimer1_us(20000u - pulse_us);
+    TMR1IF=0; TMR1IE=1; PEIE=1; GIE=1; TMR1ON=1;
+    LCD_Init();
+    LCD_Command(0x01); LCD_Command(0x80); LCD_String("AREA CLEAR");
+}
+
+// ---------- Main ----------
+void main(void) {
+    init_hw();
+    int step=5, pauseCounter=0;
+    unsigned int minPulse = 500;   // 0°
+unsigned int maxPulse = 2500;  // 180°
+pulse_us = minPulse;   
+    unsigned char objectDetected=0;
+    unsigned int angle;
+
+    while(1) {
+        // Sweep servo
+        if (updateFlag) {
+    updateFlag = 0;
+
+    // pause briefly at ends
+    if (pulse_us <= minPulse || pulse_us >= maxPulse) {
+        if (++pauseCounter < 25) {
+            // pause at sweep end
+        } else {
+            pauseCounter = 0;
+            step = -step; // reverse direction
+        }
+    }// update pulse
+    pulse_us = (unsigned int)((int)pulse_us + step);
+
+    // limit pulse
+    if (pulse_us < minPulse) pulse_us = minPulse;
+    if (pulse_us > maxPulse) pulse_us = maxPulse;
+
+        }
+
+        // Check for object (distance only for detection)
+        unsigned int us = measure_echo_us();
+        if(us!=0xFFFF && (us/58)<DETECT_CM) {
+            buzz_ms(FLASH_MS/10);
+            angle = pulse_to_angle(pulse_us);
+
+            if(!objectDetected) {
+                LCD_Command(0x01); LCD_Command(0x80);
+                LCD_String("OBJECT DETECTED");
+                LCD_Command(0xC0);
+                LCD_String("Angle:");
+                LCD_Char((angle/100)%10+'0');
+                LCD_Char((angle/10)%10+'0');
+                LCD_Char(angle%10+'0');
+                objectDetected=1;
+            }
+
+            soft_delay_ms(500); // pause 0.5s while showing angle
+        } else {
+            if(objectDetected) {
+                LCD_Command(0x01); LCD_Command(0x80);
+                LCD_String("AREA CLEAR");
+                objectDetected=0;
+            }
+        }
+
+        soft_delay_ms(50);
+    }
+}
